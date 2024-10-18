@@ -1,0 +1,7 @@
+[project]
+name = "ns-dbg-img"
+version = "0.1.0"
+description = "Image generator for ns-dbg"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
