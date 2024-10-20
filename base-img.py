@@ -218,7 +218,6 @@ def build_base_package_in_chroot(
 ):
     new_user_mount_ns()
     bind_mount_root_dirs(base_path, chroot_base)
-    print(f"chrooting to {chroot_base}")
     pwd = os.getcwd()
     os.chroot(chroot_base)
     os.chdir(pwd)
@@ -285,7 +284,7 @@ def package_base_image(
                 "-f",
                 "base.tar.xz",
                 "-I",
-                "xz -9 -T0",
+                "xz -T0",
                 f"--directory={tmpdir}",
                 ".",
             ],
@@ -302,15 +301,12 @@ def bind_mount_root_dirs(base_path: Path, tmp: Path):
         if p.is_symlink():
             dst = p.readlink()
             src = tmp / p.name
-            print(f"symlink {src} -> {dst}")
             src.symlink_to(dst)
         elif p.is_dir():
             dst = mkdir(tmp / p.name)
-            print(f"bind mount {p} -> {dst}")
             bind_mount(str(p), str(dst))
 
     tmp_nix = mkdir(tmp / "nix")
-    print(f"bind mount {base_path} -> {tmp_nix}")
     bind_mount(str(base_path), str(tmp_nix))
 
 
