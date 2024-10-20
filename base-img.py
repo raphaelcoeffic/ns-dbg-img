@@ -5,6 +5,7 @@ import shutil
 import subprocess
 
 from argparse import ArgumentParser
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -34,10 +35,17 @@ _mount.argtypes = (
 _mount.errcheck = _errcheck
 
 _MS_BIND = 4096
+_MS_REC = 16384
 
 
 def bind_mount(src: str, dst: str):
-    return _mount(src.encode(), dst.encode(), "".encode(), _MS_BIND, 0)
+    return _mount(
+        src.encode(),
+        dst.encode(),
+        "".encode(),
+        _MS_BIND | _MS_REC,
+        0,
+    )
 
 
 NIX_CONF = """experimental-features = nix-command flakes
@@ -97,7 +105,9 @@ def install_nix(path: Path) -> list[str]:
 
         install_script = tmp_store / ".." / "install"
         m = re.search(
-            r'^nix="(/nix/store/[^"]*)"', install_script.read_text(), re.MULTILINE
+            r'^nix="(/nix/store/[^"]*)"',
+            install_script.read_text(),
+            re.MULTILINE,
         )
         if not m:
             raise Exception("could not detect Nix store path")
@@ -203,35 +213,42 @@ def build_base() -> tuple[Path, list[str]]:
         return (path, closure)
 
 
+def build_base_package_in_chroot(
+    base_path: Path, chroot_base: Path, nix_closure: list[str]
+):
+    new_user_mount_ns()
+    bind_mount_root_dirs(base_path, chroot_base)
+    print(f"chrooting to {chroot_base}")
+    pwd = os.getcwd()
+    os.chroot(chroot_base)
+    os.chdir(pwd)
+    debug_shell_path, debug_shell_closure = build_base()
+    package_base_image(nix_closure, debug_shell_path, debug_shell_closure)
+
+
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("-p", "--path", type=Path, default=Path("./nix"))
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    base_path = args.path
-
-    # Install Nix package manager
-    nix_closure = install_nix(base_path)
-
-    # Mount the nix directories
-    new_user_mount_ns()
-    bind_mount(str(base_path), "/nix")
-
-    # Build debug shell
-    debug_shell_path, debug_shell_closure = build_base()
-
+def package_base_image(
+    nix_closure: list[str],
+    debug_shell_path: Path,
+    debug_shell_closure: list[str],
+):
     with TemporaryDirectory() as tmpdir:
         keep_store_paths = set(nix_closure) | set(debug_shell_closure)
 
-        def filter_store_paths(current_dir: str, entries: list[str]) -> list[str]:
+        def filter_store_paths(
+            current_dir: str, entries: list[str]
+        ) -> list[str]:
             # Do not keep /nix/.cache
             if current_dir == "/nix":
                 return list(
                     filter(
-                        lambda p: p not in {".base", ".bin", "etc", "var", "store"},
+                        lambda p: p
+                        not in {".base", ".bin", "etc", "var", "store"},
                         entries,
                     )
                 )
@@ -264,14 +281,83 @@ def main():
         subprocess.run(
             [
                 "tar",
-                "cJf",
+                "-c",
+                "-f",
                 "base.tar.xz",
+                "-I",
+                "xz -9 -T0",
                 f"--directory={tmpdir}",
                 ".",
             ],
             env=os.environ,
         )
         print("done")
+
+
+def bind_mount_root_dirs(base_path: Path, tmp: Path):
+    for p in Path("/").iterdir():
+        if str(p) == "/nix":
+            continue
+
+        if p.is_symlink():
+            dst = p.readlink()
+            src = tmp / p.name
+            print(f"symlink {src} -> {dst}")
+            src.symlink_to(dst)
+        elif p.is_dir():
+            dst = mkdir(tmp / p.name)
+            print(f"bind mount {p} -> {dst}")
+            bind_mount(str(p), str(dst))
+
+    tmp_nix = mkdir(tmp / "nix")
+    print(f"bind mount {base_path} -> {tmp_nix}")
+    bind_mount(str(base_path), str(tmp_nix))
+
+
+def check_userns_restrictions():
+    """Checks AppArmor user namespace restrictions.
+    See https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction
+    """
+
+    sys_kernel = Path("/proc/sys/kernel")
+
+    unprivileged_userns_clone = sys_kernel / "unprivileged_userns_clone"
+    if unprivileged_userns_clone.exists():
+        val = int(unprivileged_userns_clone.read_text().strip())
+        assert val == 1, "unprivileged user namespaces disabled in kernel"
+
+    # TODO: this one should be a warning, as it could be allowed via policy / profile    
+    apparmor_restrict_unprivileged_userns = sys_kernel / "apparmor_restrict_unprivileged_userns"
+    if apparmor_restrict_unprivileged_userns.exists():
+        val = int(apparmor_restrict_unprivileged_userns.read_text().strip())
+        assert val == 0, "unprivileged user namespaces restricted by AppArmor"
+
+
+def main():
+    args = parse_args()
+    base_path = args.path
+
+    try:
+        check_userns_restrictions()
+    except AssertionError as e:
+        print("Error:", e)
+        exit(1)
+
+    # Install Nix package manager
+    nix_closure = install_nix(base_path)
+
+    with TemporaryDirectory() as tmpdir:
+        child_pid = os.fork()
+        if child_pid == 0:
+            # child
+            with suppress(KeyboardInterrupt):
+                build_base_package_in_chroot(
+                    base_path, Path(tmpdir), nix_closure
+                )
+            os._exit(0)
+
+        # parent
+        os.waitpid(child_pid, 0)
 
 
 if __name__ == "__main__":

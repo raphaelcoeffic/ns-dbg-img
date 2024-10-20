@@ -5,3 +5,15 @@ description = "Image generator for ns-dbg"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
+
+[tool.uv]
+dev-dependencies = [
+    "ruff>=0.5",
+    "mypy>=1.11",
+    "pyright>=1.1.385",
+]
+
+[tool.ruff]
+line-length = 80
+indent-width = 4
+
